@@ -1,0 +1,10 @@
+# Архивы для локального запуска и передачи
+*.zip
+
+# Служебные файлы Vercel CLI
+.vercel/
+
+# Служебные файлы ОС
+Thumbs.db
+desktop.ini
+.DS_Store
