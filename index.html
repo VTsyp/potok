@@ -16,6 +16,11 @@
         <span class="brand-name">Поток</span>
       </div>
       <div class="topbar-actions">
+        <button class="stream-pill" id="streamBtn" type="button" aria-label="Выбрать поток">
+          <span class="stream-pill-dot" aria-hidden="true"></span>
+          <span class="stream-pill-name" id="streamName">Поток</span>
+          <span class="stream-pill-chev" aria-hidden="true">⌄</span>
+        </button>
         <button class="icon-btn account-btn" id="accountBtn" type="button" aria-label="Профиль">
           <svg viewBox="0 0 24 24" width="19" height="19" aria-hidden="true">
             <circle cx="12" cy="8.4" r="3.4" fill="none" stroke="currentColor" stroke-width="1.8"/>
@@ -79,6 +84,9 @@
   <div class="modal-root" id="modalRoot"></div>
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
+  <script src="config.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

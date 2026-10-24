@@ -6,6 +6,11 @@
 
 const LS_KEY = 'potok_state_v2';
 const ACCOUNT_KEY = 'potok_account_v1';
+const ACTIVE_STREAM_KEY = 'potok_active_stream_v1';
+const SUPABASE_CONFIG = window.POTOK_SUPABASE || {};
+const sb = (SUPABASE_CONFIG.url && SUPABASE_CONFIG.anonKey && window.supabase)
+  ? window.supabase.createClient(SUPABASE_CONFIG.url, SUPABASE_CONFIG.anonKey)
+  : null;
 
 const EXPENSE_CATS = [
   { id: 'food',      name: 'Продукты',      color: '#ff8a5b', emoji: '🛒' },
@@ -262,6 +267,17 @@ function monthKeyOfMonthsAgo(n) {
    Состояние
    ============================================================ */
 
+function emptyState() {
+  return { currency: 'RUB', transactions: [], goal: null };
+}
+function normalizeState(s) {
+  const out = (s && typeof s === 'object') ? s : emptyState();
+  if (!Array.isArray(out.transactions)) out.transactions = [];
+  if (!out.goal) out.goal = null;
+  if (!CURRENCIES[out.currency]) out.currency = 'RUB';
+  return out;
+}
+
 let state = loadState();
 
 function loadState() {
@@ -269,58 +285,123 @@ function loadState() {
     const raw = localStorage.getItem(LS_KEY);
     if (raw) {
       const s = JSON.parse(raw);
-      if (s && Array.isArray(s.transactions)) {
-        if (!s.goal) s.goal = null;
-        if (!CURRENCIES[s.currency]) s.currency = 'RUB';
-        return s;
-      }
+      if (s && Array.isArray(s.transactions)) return normalizeState(s);
     }
   } catch (e) { /* localStorage может быть недоступен */ }
-  const demo = seedState();
-  persistState(demo);
-  return demo;
+  return emptyState();
 }
 function persistState(s) {
   try { localStorage.setItem(LS_KEY, JSON.stringify(s || state)); } catch (e) { /* ignore */ }
 }
-function persist() { persistState(state); }
+function persist() {
+  persistState(state);
+  scheduleCloudSave();
+}
 
-/* ---- локальный профиль и приглашения ---- */
+/* ---- облако, аккаунт и потоки ---- */
 
-function loadAccount() {
-  try {
-    const raw = localStorage.getItem(ACCOUNT_KEY);
-    if (raw) {
-      const a = JSON.parse(raw);
-      if (a && a.email) return a;
-    }
-  } catch (e) { /* ignore */ }
-  return null;
-}
-function persistAccount() {
-  try {
-    if (account) localStorage.setItem(ACCOUNT_KEY, JSON.stringify(account));
-    else localStorage.removeItem(ACCOUNT_KEY);
-  } catch (e) { /* ignore */ }
-}
-function makeInviteCode() {
-  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let code = '';
-  for (let i = 0; i < 5; i++) code += alphabet[Math.floor(Math.random() * alphabet.length)];
-  return 'P' + code;
-}
+let authUser = null;
+let account = null;
+let streams = [];
+let activeStream = null;
+let cloudSaveTimer = null;
+let cloudSaving = false;
+let cloudDirty = false;
+let realtimeChannel = null;
+let inviteRef = '';
+try {
+  const params = new URLSearchParams(location.search);
+  inviteRef = (params.get('join') || params.get('ref') || '').toUpperCase();
+} catch (e) { inviteRef = ''; }
+
 function inviteLink(code) {
   const base = location.protocol === 'file:'
     ? location.href.split('?')[0]
     : location.origin + location.pathname;
-  return base + '?ref=' + encodeURIComponent(code);
+  return base + '?join=' + encodeURIComponent(code);
 }
 
-let account = loadAccount();
-let inviteRef = '';
-try {
-  inviteRef = new URLSearchParams(location.search).get('ref') || '';
-} catch (e) { inviteRef = ''; }
+function setSyncBadge(status) {
+  const el = document.getElementById('syncBadge');
+  if (!el) return;
+  el.className = 'sync-badge' + (status ? ' is-' + status : '');
+  el.textContent = status === 'syncing' ? 'Сохраняю…' : status === 'error' ? 'Нет связи' : 'В облаке';
+}
+
+function scheduleCloudSave() {
+  if (!sb || !authUser || !activeStream) return;
+  clearTimeout(cloudSaveTimer);
+  cloudSaveTimer = setTimeout(function () {
+    cloudSaveTimer = null;
+    saveCloudState();
+  }, 350);
+}
+
+async function saveCloudState() {
+  if (!sb || !authUser || !activeStream) return;
+  if (cloudSaving) { cloudDirty = true; return; }
+
+  cloudSaving = true;
+  const streamId = activeStream.id;
+  const snapshot = JSON.parse(JSON.stringify(state));
+  setSyncBadge('syncing');
+
+  try {
+    const { error } = await sb.from('stream_states').upsert({
+      stream_id: streamId,
+      state: snapshot,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'stream_id' });
+    if (error) throw error;
+    setSyncBadge('saved');
+  } catch (e) {
+    console.warn('Potok cloud save:', e);
+    setSyncBadge('error');
+  } finally {
+    cloudSaving = false;
+    if (cloudDirty) {
+      cloudDirty = false;
+      scheduleCloudSave();
+    }
+  }
+}
+
+async function flushCloudSave() {
+  if (cloudSaveTimer) {
+    clearTimeout(cloudSaveTimer);
+    cloudSaveTimer = null;
+  }
+  if (cloudSaving) {
+    cloudDirty = true;
+    return;
+  }
+  await saveCloudState();
+}
+
+function subscribeStream() {
+  if (!sb) return;
+  if (realtimeChannel) {
+    sb.removeChannel(realtimeChannel);
+    realtimeChannel = null;
+  }
+  if (!activeStream) return;
+
+  const streamId = activeStream.id;
+  realtimeChannel = sb.channel('potok-stream-' + streamId)
+    .on('postgres_changes', {
+      event: 'UPDATE',
+      schema: 'public',
+      table: 'stream_states',
+      filter: 'stream_id=eq.' + streamId,
+    }, function (payload) {
+      if (!payload || !payload.new || !payload.new.state) return;
+      if (JSON.stringify(payload.new.state) === JSON.stringify(state)) return;
+      state = normalizeState(payload.new.state);
+      persistState(state);
+      refresh();
+    })
+    .subscribe();
+}
 
 const ui = {
   tab: 'home',
@@ -625,8 +706,8 @@ function renderHome() {
   const refBanner = (inviteRef && !account)
     ? '<button class="ref-banner" type="button" data-register>' +
         '<span class="rb-emoji">🎁</span>' +
-        '<span class="rb-info"><b>Вас пригласили в Поток</b>' +
-        '<small>Код ' + esc(inviteRef) + ' · Зарегистрируйтесь по почте</small></span>' +
+        '<span class="rb-info"><b>Вас пригласили в поток</b>' +
+        '<small>Код ' + esc(inviteRef) + ' · Войдите, чтобы присоединиться</small></span>' +
         '<span class="rb-arrow">→</span>' +
       '</button>'
     : '';
@@ -1377,12 +1458,15 @@ function openGoalSheet() {
   });
 }
 
-/* ---------- профиль и приглашения ---------- */
+/* ---------- аккаунт, облако и потоки ---------- */
 
 const USER_ICON = '<svg viewBox="0 0 24 24" width="19" height="19" aria-hidden="true">' +
   '<circle cx="12" cy="8.4" r="3.4" fill="none" stroke="currentColor" stroke-width="1.8"></circle>' +
   '<path d="M5.4 20c.5-3.4 3.1-5.4 6.6-5.4s6.1 2 6.6 5.4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"></path>' +
   '</svg>';
+
+let authMode = 'login';
+let authLoading = false;
 
 function accountInitial(v) {
   const s = String(v || '').trim();
@@ -1403,48 +1487,134 @@ function renderAccountBtn() {
   }
 }
 
+function renderStreamName() {
+  const nameEl = $('#streamName');
+  const btn = $('#streamBtn');
+  if (!nameEl || !btn) return;
+  nameEl.textContent = activeStream ? activeStream.name : 'Мой поток';
+  btn.classList.toggle('is-guest', !account);
+  btn.setAttribute('aria-label', activeStream ? 'Поток: ' + activeStream.name : 'Выбрать поток');
+}
+
+function authErrorText(err) {
+  const msg = String((err && (err.message || err.error_description || err.msg)) || '');
+  if (/Invalid login credentials/i.test(msg)) return 'Неверная почта или пароль.';
+  if (/Email not confirmed/i.test(msg)) return 'Сначала подтвердите почту — проверьте письмо.';
+  if (/User already registered/i.test(msg)) return 'Такая почта уже зарегистрирована. Перейдите на вкладку «Войти».';
+  if (/Password should be/i.test(msg)) return 'Пароль должен быть не короче 6 символов.';
+  if (/rate limit|too many/i.test(msg)) return 'Слишком много попыток. Подождите минуту.';
+  if (/Failed to fetch|NetworkError/i.test(msg)) return 'Нет связи с сервером. Проверьте интернет.';
+  if (/invite_not_found/i.test(msg)) return 'Приглашение не найдено или истекло.';
+  return msg || 'Не получилось. Попробуйте ещё раз.';
+}
+
 function openRegisterSheet() {
+  openAuthSheet('signup');
+}
+
+function openAuthSheet(mode) {
+  if (!sb) { toast('Облако не настроено'); return; }
+  authMode = mode === 'signup' ? 'signup' : 'login';
+  const isSignup = authMode === 'signup';
+
   openSheet(
     '<div class="sheet-handle"></div>' +
-    '<h2>Регистрация по почте</h2>' +
-    '<p class="sheet-sub">Создайте профиль, чтобы приглашать друзей и хранить свой прогресс.</p>' +
-    '<label class="field"><span>Как вас зовут</span>' +
-      '<input id="regName" type="text" maxlength="40" placeholder="Имя" autocomplete="name"></label>' +
-    '<label class="field"><span>Email</span>' +
-      '<input id="regEmail" type="email" placeholder="you@example.com" autocomplete="email"></label>' +
+    '<h2>' + (isSignup ? 'Создать аккаунт' : 'Вход по почте') + '</h2>' +
+    '<p class="sheet-sub">' + (isSignup
+      ? 'Аккаунт нужен, чтобы данные сохранялись и были доступны на других устройствах.'
+      : 'Войдите, чтобы вернуться к своим потокам и операциям.') + '</p>' +
+    '<div class="auth-tabs">' +
+      '<button class="auth-tab' + (!isSignup ? ' is-active' : '') + '" type="button" data-auth-mode="login">Войти</button>' +
+      '<button class="auth-tab' + (isSignup ? ' is-active' : '') + '" type="button" data-auth-mode="signup">Регистрация</button>' +
+    '</div>' +
     (inviteRef
-      ? '<div class="ref-chip"><span>Код приглашения</span><b>' + esc(inviteRef) + '</b></div>'
+      ? '<div class="ref-chip"><span>Приглашение в поток</span><b>' + esc(inviteRef) + '</b></div>'
       : '') +
-    '<button class="btn primary" type="button" id="registerBtn">Создать аккаунт</button>' +
-    '<p class="auth-note">Демо-режим: профиль сохраняется только в этом браузере. Письмо с подтверждением не отправляется.</p>'
+    (isSignup
+      ? '<label class="field"><span>Как вас зовут</span>' +
+        '<input id="authName" type="text" maxlength="40" placeholder="Имя" autocomplete="name"></label>'
+      : '') +
+    '<label class="field"><span>Email</span>' +
+      '<input id="authEmail" type="email" placeholder="you@example.com" autocomplete="email"></label>' +
+    '<label class="field"><span>Пароль</span>' +
+      '<input id="authPassword" type="password" minlength="6" placeholder="Минимум 6 символов" autocomplete="' + (isSignup ? 'new-password' : 'current-password') + '"></label>' +
+    '<div class="auth-error" id="authError"></div>' +
+    '<button class="btn primary" type="button" id="authSubmit">' + (isSignup ? 'Создать аккаунт' : 'Войти') + '</button>' +
+    '<p class="auth-note">' + (isSignup
+      ? 'После регистрации может потребоваться подтвердить почту. Пароль хранится в Supabase в защищённом виде.'
+      : 'Пароль не хранится в приложении. Сессия сохраняется в этом браузере.') + '</p>'
   );
 
-  setTimeout(function () { const el = $('#regName'); if (el) el.focus(); }, 120);
+  setTimeout(function () {
+    const el = $(isSignup ? '#authName' : '#authEmail');
+    if (el) el.focus();
+  }, 120);
 
-  $('#registerBtn').addEventListener('click', function () {
-    const name = $('#regName').value.trim();
-    const email = $('#regEmail').value.trim();
-    if (!name) { toast('Введите имя'); $('#regName').focus(); return; }
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) { toast('Проверьте адрес почты'); $('#regEmail').focus(); return; }
+  document.querySelectorAll('[data-auth-mode]').forEach(function (tab) {
+    tab.addEventListener('click', function () {
+      openAuthSheet(tab.dataset.authMode);
+    });
+  });
 
-    account = {
-      name: name,
-      email: email,
-      code: makeInviteCode(),
-      invitedBy: inviteRef || '',
-      createdAt: new Date().toISOString(),
-    };
-    persistAccount();
-    inviteRef = '';
-    closeSheet();
-    refresh();
-    toast('Аккаунт создан: ' + email);
+  $('#authSubmit').addEventListener('click', submitAuth);
+  $('#authPassword').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') submitAuth();
   });
 }
 
+async function submitAuth() {
+  if (!sb) return;
+  const isSignup = authMode === 'signup';
+  const email = $('#authEmail').value.trim();
+  const password = $('#authPassword').value;
+  const name = isSignup ? $('#authName').value.trim() : '';
+  const errEl = $('#authError');
+  const btn = $('#authSubmit');
+
+  errEl.textContent = '';
+  if (isSignup && !name) { errEl.textContent = 'Введите имя.'; $('#authName').focus(); return; }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) { errEl.textContent = 'Проверьте адрес почты.'; $('#authEmail').focus(); return; }
+  if (password.length < 6) { errEl.textContent = 'Пароль должен быть не короче 6 символов.'; $('#authPassword').focus(); return; }
+
+  const oldText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = isSignup ? 'Создаю…' : 'Вхожу…';
+
+  try {
+    if (isSignup) {
+      const { data, error } = await sb.auth.signUp({
+        email: email,
+        password: password,
+        options: { data: { name: name } },
+      });
+      if (error) throw error;
+      if (data && data.session && data.user) {
+        await handleSignedIn(data.user);
+        closeSheet();
+        toast('Аккаунт создан');
+      } else {
+        errEl.textContent = 'Аккаунт создан. Подтвердите почту по ссылке из письма, затем войдите.';
+      }
+    } else {
+      const { data, error } = await sb.auth.signInWithPassword({ email: email, password: password });
+      if (error) throw error;
+      if (data && data.user) {
+        await handleSignedIn(data.user);
+        closeSheet();
+        toast('Вы вошли');
+      }
+    }
+  } catch (e) {
+    errEl.textContent = authErrorText(e);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = oldText;
+  }
+}
+
 function openAccountSheet() {
-  if (!account) { openRegisterSheet(); return; }
-  const since = account.createdAt ? fullDateLabel(account.createdAt.slice(0, 10)) : '';
+  if (!account) { openAuthSheet('login'); return; }
+  const since = account.createdAt ? fullDateLabel(String(account.createdAt).slice(0, 10)) : '';
 
   openSheet(
     '<div class="sheet-handle"></div>' +
@@ -1453,40 +1623,104 @@ function openAccountSheet() {
       '<h2>' + esc(account.name) + '</h2>' +
       '<p>' + esc(account.email) + (since ? ' · с нами с ' + since : '') + '</p>' +
     '</div>' +
+    (activeStream
+      ? '<div class="ref-chip"><span>Текущий поток</span><b>' + esc(activeStream.name) + '</b></div>'
+      : '') +
     '<button class="btn primary" type="button" id="accountInvite" style="margin-bottom:9px">Пригласить друга</button>' +
+    '<button class="btn ghost" type="button" id="accountStreams" style="margin-bottom:9px">Мои потоки</button>' +
     '<button class="btn ghost danger" type="button" id="accountLogout">Выйти из аккаунта</button>' +
-    '<p class="auth-note">Демо-профиль хранится локально в этом браузере.</p>'
+    '<p class="auth-note">Данные синхронизируются с облаком. <span id="syncBadge" class="sync-badge">В облаке</span></p>'
   );
 
   $('#accountInvite').addEventListener('click', openInviteSheet);
-  $('#accountLogout').addEventListener('click', function () {
-    account = null;
-    persistAccount();
+  $('#accountStreams').addEventListener('click', openStreamsSheet);
+  $('#accountLogout').addEventListener('click', async function () {
+    if (!sb) return;
+    await flushCloudSave();
+    await sb.auth.signOut();
+    handleSignedOut();
     closeSheet();
-    refresh();
     toast('Вы вышли из аккаунта');
   });
 }
 
-function openInviteSheet() {
-  if (!account) { openRegisterSheet(); return; }
-  const link = inviteLink(account.code);
-  const subject = encodeURIComponent('Приглашаю тебя в Поток');
-  const body = encodeURIComponent('Привет! Я веду финансы в приложении «Поток». Присоединяйся:\n\n' + link + '\n\nМой код: ' + account.code);
+function inviteQrSvg(link) {
+  if (typeof window.qrcode !== 'function') return '';
+  try {
+    const qr = window.qrcode(0, 'M');
+    qr.addData(link);
+    qr.make();
+    return qr.createSvgTag({ cellSize: 5, margin: 0, scalable: true });
+  } catch (e) {
+    console.warn('Potok QR:', e);
+    return '';
+  }
+}
+
+async function openInviteSheet() {
+  if (!account) { openAuthSheet('login'); return; }
+  if (!activeStream) await createCloudStream('Мой поток');
+  if (!activeStream || !sb) { toast('Сначала создайте поток'); return; }
+
+  let code = '';
+  try {
+    const { data, error } = await sb.rpc('create_stream_invite', { p_stream_id: activeStream.id });
+    if (error) throw error;
+    code = String(data || '').toUpperCase();
+  } catch (e) {
+    console.warn('Potok invite:', e);
+    toast('Не удалось создать приглашение');
+    return;
+  }
+  if (!code) { toast('Не удалось создать приглашение'); return; }
+
+  const link = inviteLink(code);
+  const qrSvg = inviteQrSvg(link);
+  const subject = encodeURIComponent('Приглашаю тебя в поток «' + activeStream.name + '»');
+  const body = encodeURIComponent('Привет! Присоединяйся к моему потоку «' + activeStream.name + '» в приложении «Поток»:\n\n' + link + '\n\nКод: ' + code);
 
   openSheet(
     '<div class="sheet-handle"></div>' +
     '<h2>Пригласить друга</h2>' +
-    '<p class="sheet-sub">Отправьте ссылку — друг зарегистрируется по почте и начнёт вести свои финансы.</p>' +
+    '<p class="sheet-sub">Ссылка приглашает именно в поток «' + esc(activeStream.name) + '». Другие ваши потоки другу не видны.</p>' +
+    '<div class="invite-qr">' +
+      '<div class="invite-qr-box" id="inviteQr">' +
+        (qrSvg || '<span class="invite-qr-fallback">QR-код недоступен</span>') +
+      '</div>' +
+      '<p class="invite-qr-hint">Наведите камеру телефона — откроется приглашение в этот поток</p>' +
+      '<button class="invite-qr-download" type="button" id="inviteQrDownload"' + (qrSvg ? '' : ' disabled') + '>Скачать QR</button>' +
+    '</div>' +
     '<div class="invite-link">' +
       '<input id="inviteInput" readonly value="' + esc(link) + '">' +
       '<button type="button" id="copyInvite">Копировать</button>' +
     '</div>' +
     '<a class="btn primary" id="inviteEmail" href="mailto:?subject=' + subject + '&body=' + body + '" style="margin-bottom:9px">Отправить на почту</a>' +
     '<button class="btn ghost" type="button" id="inviteShare">Поделиться ссылкой</button>' +
-    '<div class="ref-code">Ваш код приглашения: <b>' + esc(account.code) + '</b></div>' +
-    '<p class="auth-note">Демо-режим: общая база не подключена. Ссылка открывает это приложение и сохраняет код приглашения при регистрации.</p>'
+    '<div class="ref-code">Код приглашения: <b>' + esc(code) + '</b></div>' +
+    '<p class="auth-note">Код действует 90 дней. Друг сможет присоединиться после входа по почте.</p>'
   );
+
+  $('#inviteQrDownload').addEventListener('click', function () {
+    const box = $('#inviteQr');
+    const svg = box ? box.querySelector('svg') : null;
+    if (!svg) { toast('QR-код недоступен'); return; }
+
+    if (!svg.getAttribute('xmlns')) {
+      svg.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+    }
+    const blob = new Blob(['<?xml version="1.0" encoding="UTF-8"?>\n' + svg.outerHTML], {
+      type: 'image/svg+xml;charset=utf-8',
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'potok-' + code + '.svg';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+    toast('QR-код сохранён');
+  });
 
   $('#copyInvite').addEventListener('click', function () {
     const input = $('#inviteInput');
@@ -1505,7 +1739,7 @@ function openInviteSheet() {
 
   $('#inviteShare').addEventListener('click', function () {
     if (navigator.share) {
-      navigator.share({ title: 'Поток', text: 'Присоединяйся к Потоку', url: link }).catch(function () {});
+      navigator.share({ title: 'Поток', text: 'Присоединяйся к потоку «' + activeStream.name + '»', url: link }).catch(function () {});
     } else {
       const input = $('#inviteInput');
       input.select();
@@ -1513,6 +1747,294 @@ function openInviteSheet() {
         navigator.clipboard.writeText(link).then(function () { toast('Ссылка скопирована'); }).catch(function () { toast('Скопируйте ссылку вручную'); });
       } else {
         toast('Скопируйте ссылку вручную');
+      }
+    }
+  });
+}
+
+async function loadStreams() {
+  if (!sb || !authUser) { streams = []; return []; }
+  const { data, error } = await sb.from('streams')
+    .select('id,name,owner_id,created_at')
+    .order('created_at', { ascending: true });
+  if (error) {
+    console.warn('Potok streams:', error);
+    streams = [];
+    return [];
+  }
+  streams = data || [];
+  return streams;
+}
+
+async function loadStream(id) {
+  if (!sb || !authUser || !id) return;
+  await flushCloudSave();
+
+  let meta = streams.find(function (s) { return s.id === id; });
+  if (!meta) {
+    await loadStreams();
+    meta = streams.find(function (s) { return s.id === id; });
+  }
+  if (!meta) meta = { id: id, name: 'Поток', owner_id: null };
+
+  activeStream = meta;
+  try {
+    const { data, error } = await sb.from('stream_states')
+      .select('state')
+      .eq('stream_id', id)
+      .maybeSingle();
+    if (error) throw error;
+    state = normalizeState(data && data.state);
+  } catch (e) {
+    console.warn('Potok load stream:', e);
+    state = emptyState();
+  }
+
+  persistState(state);
+  try { localStorage.setItem(ACTIVE_STREAM_KEY, id); } catch (e) { /* ignore */ }
+  ui.month = currentKey();
+  refresh();
+  subscribeStream();
+  renderStreamName();
+}
+
+async function switchStream(id) {
+  if (!id) return;
+  closeSheet();
+  if (activeStream && activeStream.id === id) return;
+  await loadStream(id);
+  toast('Поток: ' + (activeStream ? activeStream.name : ''));
+}
+
+async function createCloudStream(name) {
+  if (!sb || !authUser) { openAuthSheet('login'); return false; }
+  const streamName = String(name || '').trim() || 'Мой поток';
+  try {
+    const { data, error } = await sb.rpc('create_stream', { p_name: streamName });
+    if (error) throw error;
+    await loadStreams();
+    const meta = streams.find(function (s) { return s.id === data; }) ||
+      { id: data, name: streamName, owner_id: authUser.id };
+    await loadStream(meta.id);
+    return true;
+  } catch (e) {
+    console.warn('Potok create stream:', e);
+    toast('Не удалось создать поток');
+    return false;
+  }
+}
+
+async function joinInvite(code) {
+  if (!code) return false;
+  if (!sb || !authUser) {
+    inviteRef = String(code).toUpperCase();
+    openAuthSheet('login');
+    return false;
+  }
+  try {
+    const { data, error } = await sb.rpc('join_stream', { p_code: code });
+    if (error) throw error;
+    await loadStreams();
+    const meta = streams.find(function (s) { return s.id === data; }) ||
+      { id: data, name: 'Поток', owner_id: null };
+    await loadStream(meta.id);
+    try {
+      const url = new URL(location.href);
+      url.searchParams.delete('join');
+      url.searchParams.delete('ref');
+      history.replaceState({}, '', url.pathname + (url.search || '') + url.hash);
+    } catch (e) { /* ignore */ }
+    inviteRef = '';
+    toast('Вы присоединились к потоку');
+    return true;
+  } catch (e) {
+    console.warn('Potok join:', e);
+    toast(authErrorText(e));
+    return false;
+  }
+}
+
+async function openStreamsSheet() {
+  if (!account) { openAuthSheet('login'); return; }
+  await loadStreams();
+  const rows = streams.map(function (s) {
+    const isActive = activeStream && activeStream.id === s.id;
+    const isOwner = authUser && s.owner_id === authUser.id;
+    return '<button class="stream-row' + (isActive ? ' is-active' : '') + '" type="button" data-stream="' + esc(s.id) + '">' +
+      '<span class="stream-row-avatar">' + esc(accountInitial(s.name)) + '</span>' +
+      '<span class="stream-row-info"><b>' + esc(s.name) + '</b><small>' + (isOwner ? 'владелец' : 'участник') + '</small></span>' +
+      (isActive ? '<span class="stream-row-check">✓</span>' : '') +
+    '</button>';
+  }).join('');
+
+  openSheet(
+    '<div class="sheet-handle"></div>' +
+    '<h2>Мои потоки</h2>' +
+    '<p class="sheet-sub">У каждого потока свои операции и цель. Друзья видят только тот поток, в который их пригласили.</p>' +
+    '<div class="stream-list">' + (rows || '<div class="stream-empty">Потоков пока нет. Создайте первый.</div>') + '</div>' +
+    '<button class="btn primary" type="button" id="newStream">Создать поток</button>' +
+    '<p class="auth-note">Новый поток сначала виден только вам.</p>'
+  );
+
+  document.querySelectorAll('[data-stream]').forEach(function (btn) {
+    btn.addEventListener('click', function () { switchStream(btn.dataset.stream); });
+  });
+  $('#newStream').addEventListener('click', openCreateStreamSheet);
+}
+
+function openCreateStreamSheet() {
+  openSheet(
+    '<div class="sheet-handle"></div>' +
+    '<h2>Новый поток</h2>' +
+    '<p class="sheet-sub">Например: «Семья», «Бизнес» или «Путешествия». Начнётся с нуля.</p>' +
+    '<label class="field"><span>Название</span>' +
+      '<input id="newStreamName" type="text" maxlength="60" placeholder="Мой поток" autocomplete="off"></label>' +
+    '<div class="auth-error" id="streamError"></div>' +
+    '<button class="btn primary" type="button" id="createStreamBtn">Создать поток</button>' +
+    '<p class="auth-note">Приглашённые в другие потоки люди не увидят этот поток.</p>'
+  );
+
+  setTimeout(function () { const el = $('#newStreamName'); if (el) el.focus(); }, 120);
+
+  $('#createStreamBtn').addEventListener('click', async function () {
+    const name = $('#newStreamName').value.trim();
+    const err = $('#streamError');
+    const btn = $('#createStreamBtn');
+    if (!name) { err.textContent = 'Введите название.'; $('#newStreamName').focus(); return; }
+    btn.disabled = true;
+    btn.textContent = 'Создаю…';
+    const ok = await createCloudStream(name);
+    btn.disabled = false;
+    btn.textContent = 'Создать поток';
+    if (ok) {
+      closeSheet();
+      toast('Поток создан');
+    } else {
+      err.textContent = 'Не удалось создать поток. Попробуйте ещё раз.';
+    }
+  });
+}
+
+async function handleSignedIn(user) {
+  if (!user || !sb) return;
+  if (authLoading) return;
+  if (authUser && authUser.id === user.id && account && streams.length) return;
+
+  authLoading = true;
+  try {
+    authUser = user;
+
+    let prof = null;
+    try {
+      const { data } = await sb.from('profiles')
+        .select('id,email,name,created_at')
+        .eq('id', user.id)
+        .maybeSingle();
+      prof = data;
+      if (!prof) {
+        const fallbackName = (user.user_metadata && user.user_metadata.name) || (user.email || '').split('@')[0];
+        const { data: created } = await sb.from('profiles')
+          .upsert({ id: user.id, email: user.email, name: fallbackName })
+          .select()
+          .single();
+        prof = created;
+      }
+    } catch (e) {
+      console.warn('Potok profile:', e);
+    }
+
+    account = {
+      id: user.id,
+      email: user.email || '',
+      name: (prof && prof.name) || (user.user_metadata && user.user_metadata.name) || (user.email || '').split('@')[0],
+      createdAt: (prof && prof.created_at) || user.created_at || new Date().toISOString(),
+    };
+    renderAccountBtn();
+
+    await loadStreams();
+
+    if (!streams.length) {
+      const localHasData = state.transactions.length > 0 || !!state.goal;
+      const { data: id, error } = await sb.rpc('create_stream', { p_name: 'Мой поток' });
+      if (error) throw error;
+      await loadStreams();
+      const meta = streams.find(function (s) { return s.id === id; }) ||
+        { id: id, name: 'Мой поток', owner_id: user.id };
+      activeStream = meta;
+      try { localStorage.setItem(ACTIVE_STREAM_KEY, meta.id); } catch (e) { /* ignore */ }
+
+      if (localHasData) {
+        await saveCloudState();
+        subscribeStream();
+        refresh();
+      } else {
+        await loadStream(meta.id);
+      }
+    } else {
+      let savedId = '';
+      try { savedId = localStorage.getItem(ACTIVE_STREAM_KEY) || ''; } catch (e) { /* ignore */ }
+      const meta = streams.find(function (s) { return s.id === savedId; }) || streams[0];
+      await loadStream(meta.id);
+    }
+
+    if (inviteRef) {
+      const code = inviteRef;
+      inviteRef = '';
+      await joinInvite(code);
+    }
+
+    renderStreamName();
+    refresh();
+  } catch (e) {
+    console.warn('Potok sign in:', e);
+    toast('Не удалось загрузить аккаунт');
+  } finally {
+    authLoading = false;
+  }
+}
+
+function handleSignedOut() {
+  authUser = null;
+  account = null;
+  streams = [];
+  activeStream = null;
+  if (sb && realtimeChannel) {
+    sb.removeChannel(realtimeChannel);
+    realtimeChannel = null;
+  }
+  try { localStorage.removeItem(ACTIVE_STREAM_KEY); } catch (e) { /* ignore */ }
+  state = emptyState();
+  persistState(state);
+  renderAccountBtn();
+  renderStreamName();
+  refresh();
+}
+
+async function initCloud() {
+  renderStreamName();
+  if (!sb) return;
+
+  try {
+    const { data } = await sb.auth.getSession();
+    if (data && data.session && data.session.user) {
+      await handleSignedIn(data.session.user);
+    }
+  } catch (e) {
+    console.warn('Potok session:', e);
+  }
+
+  sb.auth.onAuthStateChange(function (event, session) {
+    if (event === 'SIGNED_OUT') {
+      handleSignedOut();
+      return;
+    }
+    if (session && session.user && (event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED' || event === 'USER_UPDATED')) {
+      if (!authUser || authUser.id !== session.user.id || !account) {
+        handleSignedIn(session.user);
+      } else if (inviteRef) {
+        const code = inviteRef;
+        inviteRef = '';
+        joinInvite(code);
       }
     }
   });
@@ -1575,47 +2097,45 @@ function openMenu() {
   openSheet(
     '<div class="sheet-handle"></div>' +
     profile +
+    '<button class="menu-currency" type="button" id="menuStreams">' +
+      '<span class="mc-symbol">◇</span>' +
+      '<span class="mp-info"><b>Потоки</b><small>' + (activeStream ? esc(activeStream.name) : 'Выбрать или создать') + '</small></span>' +
+      '<span class="mp-chev">›</span>' +
+    '</button>' +
     '<button class="menu-currency" type="button" id="menuCurrency">' +
       '<span class="mc-symbol">' + esc(cur.symbol) + '</span>' +
       '<span class="mp-info"><b>Валюта</b><small>' + esc(cur.name) + ' · ' + esc(cur.short) + '</small></span>' +
       '<span class="mp-chev">›</span>' +
     '</button>' +
     '<h2>Настройки</h2>' +
-    '<p class="sheet-sub">Данные хранятся только в этом браузере. Никуда не отправляются.</p>' +
+    '<p class="sheet-sub">' + (account
+      ? 'Данные синхронизируются с облаком и доступны на других устройствах.'
+      : 'Войдите по почте, чтобы сохранять данные и приглашать друзей.') + '</p>' +
     '<button class="btn ghost" type="button" id="menuInvite" style="margin-bottom:8px">🎁 Пригласить друга</button>' +
-    '<button class="btn ghost" type="button" id="resetDemo" style="margin-bottom:8px">Загрузить демо-данные заново</button>' +
     '<button class="btn ghost danger" type="button" id="clearAll">Очистить все данные</button>' +
     '<p class="sheet-sub" style="margin-top:18px;text-align:center;font-size:10.5px">Поток · личный учёт денег</p>'
   );
 
   $('#menuProfile').addEventListener('click', function () {
     if (account) openAccountSheet();
-    else openRegisterSheet();
+    else openAuthSheet('login');
   });
 
+  $('#menuStreams').addEventListener('click', openStreamsSheet);
   $('#menuCurrency').addEventListener('click', openCurrencySheet);
 
   $('#menuInvite').addEventListener('click', function () {
     if (account) openInviteSheet();
-    else openRegisterSheet();
-  });
-
-  $('#resetDemo').addEventListener('click', function () {
-    if (!window.confirm('Заменить текущие данные демо-историей?')) return;
-    const keepCurrency = state.currency;
-    state = seedState();
-    state.currency = keepCurrency || 'RUB';
-    persist();
-    ui.month = currentKey();
-    closeSheet();
-    refresh();
-    switchTab('home');
-    toast('Демо-данные загружены');
+    else openAuthSheet('login');
   });
 
   $('#clearAll').addEventListener('click', function () {
-    if (!window.confirm('Удалить все операции и цель? Отменить это будет нельзя.')) return;
-    state = { currency: state.currency || 'RUB', transactions: [], goal: null };
+    const shared = account && activeStream;
+    const question = shared
+      ? 'Очистить все операции и цель в потоке «' + activeStream.name + '»? Это увидят все участники. Отменить будет нельзя.'
+      : 'Удалить все операции и цель? Отменить это будет нельзя.';
+    if (!window.confirm(question)) return;
+    state = emptyState();
     persist();
     closeSheet();
     refresh();
@@ -1634,6 +2154,7 @@ function refresh() {
   renderForecastView();
   renderWaste();
   renderAccountBtn();
+  renderStreamName();
 }
 
 function switchTab(tab) {
@@ -1729,11 +2250,20 @@ $('#fab').addEventListener('click', openAddSheet);
 $('#menuBtn').addEventListener('click', openMenu);
 $('#accountBtn').addEventListener('click', function () {
   if (account) openAccountSheet();
-  else openRegisterSheet();
+  else openAuthSheet('login');
+});
+
+$('#streamBtn').addEventListener('click', function () {
+  if (account) openStreamsSheet();
+  else openAuthSheet('login');
 });
 
 document.addEventListener('keydown', function (e) {
   if (e.key === 'Escape') closeSheet();
+});
+
+document.addEventListener('visibilitychange', function () {
+  if (document.visibilityState === 'hidden') flushCloudSave();
 });
 
 /* ============================================================
@@ -1742,4 +2272,6 @@ document.addEventListener('keydown', function (e) {
 
 refresh();
 renderAccountBtn();
+renderStreamName();
 switchTab('home');
+initCloud();
