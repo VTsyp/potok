@@ -7,6 +7,21 @@ create extension if not exists pg_net with schema extensions;
 alter table public.stream_states
   add column if not exists updated_by uuid references auth.users(id) on delete set null;
 
+/* Автор изменения должен совпадать с текущим пользователем.
+   null разрешён, чтобы не ломать уже открытые старые вкладки приложения. */
+drop policy if exists "stream_states_update_member" on public.stream_states;
+create policy "stream_states_update_member" on public.stream_states
+for update to authenticated
+using (public.is_stream_member(stream_id, auth.uid()))
+with check (public.is_stream_member(stream_id, auth.uid())
+  and (updated_by is null or updated_by = auth.uid()));
+
+drop policy if exists "stream_states_insert_member" on public.stream_states;
+create policy "stream_states_insert_member" on public.stream_states
+for insert to authenticated
+with check (public.is_stream_member(stream_id, auth.uid())
+  and (updated_by is null or updated_by = auth.uid()));
+
 /* Подписки браузеров и установленных приложений на push. */
 create table if not exists public.push_subscriptions (
   id uuid primary key default gen_random_uuid(),
