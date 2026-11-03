@@ -8,6 +8,7 @@ const LS_KEY = 'potok_state_v2';
 const ACCOUNT_KEY = 'potok_account_v1';
 const ACTIVE_STREAM_KEY = 'potok_active_stream_v1';
 const SUPABASE_CONFIG = window.POTOK_SUPABASE || {};
+const PUSH_PUBLIC_KEY = SUPABASE_CONFIG.vapidPublicKey || '';
 const sb = (SUPABASE_CONFIG.url && SUPABASE_CONFIG.anonKey && window.supabase)
   ? window.supabase.createClient(SUPABASE_CONFIG.url, SUPABASE_CONFIG.anonKey)
   : null;
@@ -309,10 +310,12 @@ let cloudSaving = false;
 let cloudDirty = false;
 let realtimeChannel = null;
 let inviteRef = '';
+let streamRef = '';
 try {
   const params = new URLSearchParams(location.search);
   inviteRef = (params.get('join') || params.get('ref') || '').toUpperCase();
-} catch (e) { inviteRef = ''; }
+  streamRef = params.get('stream') || '';
+} catch (e) { inviteRef = ''; streamRef = ''; }
 
 function inviteLink(code) {
   const base = location.protocol === 'file:'
@@ -347,11 +350,20 @@ async function saveCloudState() {
   setSyncBadge('syncing');
 
   try {
-    const { error } = await sb.from('stream_states').upsert({
+    const payload = {
       stream_id: streamId,
       state: snapshot,
       updated_at: new Date().toISOString(),
-    }, { onConflict: 'stream_id' });
+      updated_by: authUser.id,
+    };
+    let { error } = await sb.from('stream_states').upsert(payload, { onConflict: 'stream_id' });
+
+    // Совместимость с проектом, где миграция push ещё не применена.
+    if (error && /updated_by/i.test(String(error.message || ''))) {
+      delete payload.updated_by;
+      const retry = await sb.from('stream_states').upsert(payload, { onConflict: 'stream_id' });
+      error = retry.error;
+    }
     if (error) throw error;
     setSyncBadge('saved');
   } catch (e) {
@@ -1508,6 +1520,197 @@ function authErrorText(err) {
   return msg || 'Не получилось. Попробуйте ещё раз.';
 }
 
+/* ---------- push-уведомления ---------- */
+
+function isIOSDevice() {
+  return /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+}
+
+function isStandaloneApp() {
+  return window.navigator.standalone === true ||
+    (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches);
+}
+
+function pushSupported() {
+  return !!PUSH_PUBLIC_KEY &&
+    typeof Notification !== 'undefined' &&
+    'serviceWorker' in navigator &&
+    'PushManager' in window;
+}
+
+function urlBase64ToUint8Array(base64String) {
+  const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const raw = window.atob(base64);
+  const output = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) output[i] = raw.charCodeAt(i);
+  return output;
+}
+
+async function ensureServiceWorker() {
+  if (!('serviceWorker' in navigator)) return null;
+  await navigator.serviceWorker.register('/sw.js');
+  return navigator.serviceWorker.ready;
+}
+
+async function getPushSubscription() {
+  if (!pushSupported()) return null;
+  try {
+    const reg = await navigator.serviceWorker.getRegistration('/');
+    return reg ? await reg.pushManager.getSubscription() : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function savePushSubscription(sub) {
+  if (!sb || !authUser || !sub) return false;
+  const json = sub.toJSON();
+  const { error } = await sb.rpc('register_push_subscription', {
+    p_endpoint: sub.endpoint,
+    p_p256dh: json.keys.p256dh,
+    p_auth_key: json.keys.auth,
+    p_user_agent: navigator.userAgent,
+  });
+  if (error) throw error;
+  return true;
+}
+
+async function syncPushSubscription() {
+  if (!sb || !authUser || !pushSupported()) return;
+  if (Notification.permission !== 'granted') return;
+  try {
+    const sub = await getPushSubscription();
+    if (sub) await savePushSubscription(sub);
+  } catch (e) {
+    console.warn('Potok push sync:', e);
+  }
+}
+
+async function unregisterPushRecord() {
+  if (!sb || !authUser) return;
+  try {
+    const sub = await getPushSubscription();
+    if (sub) await sb.from('push_subscriptions').delete().eq('endpoint', sub.endpoint);
+  } catch (e) {
+    console.warn('Potok push remove:', e);
+  }
+}
+
+async function enablePush() {
+  if (!pushSupported()) { toast('Этот браузер не поддерживает уведомления'); return; }
+  if (isIOSDevice() && !isStandaloneApp()) { openPushHowSheet(); return; }
+  if (Notification.permission === 'denied') {
+    toast('Разрешите уведомления в настройках телефона');
+    return;
+  }
+
+  let permission = Notification.permission;
+  if (permission !== 'granted') permission = await Notification.requestPermission();
+  if (permission !== 'granted') { toast('Уведомления не разрешены'); return; }
+
+  try {
+    const reg = await ensureServiceWorker();
+    if (!reg) throw new Error('service worker unavailable');
+
+    let sub = await reg.pushManager.getSubscription();
+    if (!sub) {
+      sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(PUSH_PUBLIC_KEY),
+      });
+    }
+
+    await savePushSubscription(sub);
+    toast('Уведомления включены');
+    openPushSheet();
+  } catch (e) {
+    console.warn('Potok push enable:', e);
+    toast('Не удалось включить уведомления');
+  }
+}
+
+async function disablePush() {
+  try {
+    const sub = await getPushSubscription();
+    if (sub) {
+      if (sb) await sb.from('push_subscriptions').delete().eq('endpoint', sub.endpoint);
+      await sub.unsubscribe();
+    }
+    toast('Уведомления выключены');
+  } catch (e) {
+    console.warn('Potok push disable:', e);
+    toast('Не удалось выключить уведомления');
+  }
+  openPushSheet();
+}
+
+function openPushHowSheet() {
+  openSheet(
+    '<div class="sheet-handle"></div>' +
+    '<h2>Добавить на iPhone</h2>' +
+    '<p class="sheet-sub">Push на iPhone работают у сайтов, добавленных на экран «Домой».</p>' +
+    '<ol class="push-steps">' +
+      '<li>Откройте <b>potok-ys2h.vercel.app</b> в Safari.</li>' +
+      '<li>Нажмите кнопку «Поделиться» внизу.</li>' +
+      '<li>Выберите «На экран „Домой“» и нажмите «Добавить».</li>' +
+      '<li>Откройте «Поток» с новой иконки.</li>' +
+      '<li>Войдите и снова откройте «Уведомления».</li>' +
+    '</ol>' +
+    '<button class="btn primary" type="button" id="pushHowClose">Понятно</button>'
+  );
+  $('#pushHowClose').addEventListener('click', openPushSheet);
+}
+
+async function openPushSheet() {
+  if (!account) { openAuthSheet('login'); return; }
+  if (!sb) { toast('Облако не настроено'); return; }
+
+  const ios = isIOSDevice();
+  const standalone = isStandaloneApp();
+  const supported = pushSupported();
+  let sub = null;
+  if (supported && (!ios || standalone)) sub = await getPushSubscription();
+
+  let status = '';
+  let statusClass = '';
+  let action = '';
+
+  if (ios && !standalone) {
+    status = 'На iPhone уведомления работают только у приложения, добавленного на экран «Домой».';
+    action = '<button class="btn primary" type="button" id="pushHow">Как добавить на экран</button>';
+  } else if (!supported) {
+    status = 'Этот браузер не поддерживает push-уведомления. На iPhone нужна iOS 16.4 или новее.';
+  } else if (Notification.permission === 'denied') {
+    status = 'Уведомления запрещены. Разрешите их в настройках телефона: Настройки → Поток → Уведомления.';
+  } else if (sub) {
+    status = 'Уведомления включены на этом устройстве.';
+    statusClass = ' is-on';
+    action = '<button class="btn ghost danger" type="button" id="pushToggle">Выключить уведомления</button>';
+  } else {
+    status = 'Уведомления выключены. Включите, чтобы получать сообщения об изменениях от других участников.';
+    action = '<button class="btn primary" type="button" id="pushToggle">Включить уведомления</button>';
+  }
+
+  openSheet(
+    '<div class="sheet-handle"></div>' +
+    '<h2>Уведомления</h2>' +
+    '<p class="sheet-sub">Присылать push, когда другой человек добавит, изменит или удалит данные в общем потоке.</p>' +
+    '<div class="push-status' + statusClass + '"><span class="push-status-dot"></span><span>' + status + '</span></div>' +
+    action +
+    '<p class="auth-note">Уведомления приходят на это устройство. Для каждого телефона их нужно включить отдельно.</p>'
+  );
+
+  if ($('#pushToggle')) {
+    $('#pushToggle').addEventListener('click', function () {
+      if (sub) disablePush();
+      else enablePush();
+    });
+  }
+  if ($('#pushHow')) $('#pushHow').addEventListener('click', openPushHowSheet);
+}
+
 function openRegisterSheet() {
   openAuthSheet('signup');
 }
@@ -1628,15 +1831,18 @@ function openAccountSheet() {
       : '') +
     '<button class="btn primary" type="button" id="accountInvite" style="margin-bottom:9px">Пригласить друга</button>' +
     '<button class="btn ghost" type="button" id="accountStreams" style="margin-bottom:9px">Мои потоки</button>' +
+    '<button class="btn ghost" type="button" id="accountPush" style="margin-bottom:9px">🔔 Уведомления</button>' +
     '<button class="btn ghost danger" type="button" id="accountLogout">Выйти из аккаунта</button>' +
     '<p class="auth-note">Данные синхронизируются с облаком. <span id="syncBadge" class="sync-badge">В облаке</span></p>'
   );
 
   $('#accountInvite').addEventListener('click', openInviteSheet);
   $('#accountStreams').addEventListener('click', openStreamsSheet);
+  $('#accountPush').addEventListener('click', openPushSheet);
   $('#accountLogout').addEventListener('click', async function () {
     if (!sb) return;
     await flushCloudSave();
+    await unregisterPushRecord();
     await sb.auth.signOut();
     handleSignedOut();
     closeSheet();
@@ -1973,8 +2179,17 @@ async function handleSignedIn(user) {
     } else {
       let savedId = '';
       try { savedId = localStorage.getItem(ACTIVE_STREAM_KEY) || ''; } catch (e) { /* ignore */ }
-      const meta = streams.find(function (s) { return s.id === savedId; }) || streams[0];
+      const pushed = streamRef ? streams.find(function (s) { return s.id === streamRef; }) : null;
+      const meta = pushed || streams.find(function (s) { return s.id === savedId; }) || streams[0];
       await loadStream(meta.id);
+      if (pushed) {
+        streamRef = '';
+        try {
+          const url = new URL(location.href);
+          url.searchParams.delete('stream');
+          history.replaceState({}, '', url.pathname + (url.search || '') + url.hash);
+        } catch (e) { /* ignore */ }
+      }
     }
 
     if (inviteRef) {
@@ -1985,6 +2200,7 @@ async function handleSignedIn(user) {
 
     renderStreamName();
     refresh();
+    syncPushSubscription();
   } catch (e) {
     console.warn('Potok sign in:', e);
     toast('Не удалось загрузить аккаунт');
@@ -2112,6 +2328,7 @@ function openMenu() {
       ? 'Данные синхронизируются с облаком и доступны на других устройствах.'
       : 'Войдите по почте, чтобы сохранять данные и приглашать друзей.') + '</p>' +
     '<button class="btn ghost" type="button" id="menuInvite" style="margin-bottom:8px">🎁 Пригласить друга</button>' +
+    '<button class="btn ghost" type="button" id="menuPush" style="margin-bottom:8px">🔔 Уведомления</button>' +
     '<button class="btn ghost danger" type="button" id="clearAll">Очистить все данные</button>' +
     '<p class="sheet-sub" style="margin-top:18px;text-align:center;font-size:10.5px">Поток · личный учёт денег</p>'
   );
@@ -2126,6 +2343,11 @@ function openMenu() {
 
   $('#menuInvite').addEventListener('click', function () {
     if (account) openInviteSheet();
+    else openAuthSheet('login');
+  });
+
+  $('#menuPush').addEventListener('click', function () {
+    if (account) openPushSheet();
     else openAuthSheet('login');
   });
 
@@ -2275,3 +2497,11 @@ renderAccountBtn();
 renderStreamName();
 switchTab('home');
 initCloud();
+
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', function () {
+    navigator.serviceWorker.register('/sw.js').catch(function (e) {
+      console.warn('Potok service worker:', e);
+    });
+  });
+}

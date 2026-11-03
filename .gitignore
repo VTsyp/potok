@@ -4,6 +4,9 @@
 # Служебные файлы Vercel CLI
 .vercel/
 
+# Зависимости Node для push-обработчика
+node_modules/
+
 # Служебные файлы ОС
 Thumbs.db
 desktop.ini

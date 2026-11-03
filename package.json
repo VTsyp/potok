@@ -1,0 +1,12 @@
+{
+  "name": "potok-push",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Push sender for Potok",
+  "dependencies": {
+    "web-push": "^3.6.7"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
