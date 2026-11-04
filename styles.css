@@ -1194,6 +1194,45 @@ b, strong { font-weight: 700; }
   line-height: 1.55;
   color: var(--muted-2);
 }
+.push-status {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin: 0 0 13px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, .03);
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+.push-status.is-on {
+  border-color: rgba(61, 220, 151, .3);
+  background: rgba(61, 220, 151, .07);
+  color: var(--text);
+}
+.push-status-dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  margin-top: 5px;
+  border-radius: 50%;
+  background: var(--muted-2);
+}
+.push-status.is-on .push-status-dot {
+  background: var(--green);
+  box-shadow: 0 0 0 3px rgba(61, 220, 151, .13);
+}
+.push-steps {
+  margin: 0 0 14px;
+  padding-left: 20px;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.65;
+}
+.push-steps li { margin-bottom: 7px; }
+.push-steps li::marker { color: var(--green); font-weight: 700; }
 .ref-chip {
   display: flex;
   align-items: center;
