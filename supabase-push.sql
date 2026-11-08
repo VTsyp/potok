@@ -109,6 +109,19 @@ as $$
   end;
 $$;
 
+/* Подпись операции: комментарий в кавычках, если он не повторяет категорию. */
+create or replace function public.push_tx_note(p_tx jsonb)
+returns text
+language sql
+immutable
+as $$
+  select case
+    when coalesce(btrim(p_tx->>'note'), '') = '' then ''
+    when lower(btrim(p_tx->>'note')) = lower(public.push_category_name(p_tx->>'category')) then ''
+    else ' «' || left(regexp_replace(btrim(p_tx->>'note'), '\s+', ' ', 'g'), 40) || '»'
+  end;
+$$;
+
 /* Сумма в валюте потока. В базе суммы хранятся в рублях. */
 create or replace function public.push_money(p_base numeric, p_currency text)
 returns text
@@ -206,9 +219,7 @@ begin
       case when v_tx->>'type' = 'income' then 'Новый доход ' else 'Новый расход ' end
       || public.push_money((v_tx->>'amount')::numeric, v_currency)
       || ' · ' || public.push_category_name(v_tx->>'category')
-      || case when coalesce(btrim(v_tx->>'note'), '') <> ''
-              then ' «' || left(regexp_replace(btrim(v_tx->>'note'), '\s+', ' ', 'g'), 40) || '»'
-              else '' end
+      || public.push_tx_note(v_tx)
     );
     v_extra := v_extra + greatest(jsonb_array_length(v_added) - 1, 0);
   end if;
@@ -219,9 +230,7 @@ begin
       'Удалён ' || case when v_tx->>'type' = 'income' then 'доход ' else 'расход ' end
       || public.push_money((v_tx->>'amount')::numeric, v_currency)
       || ' · ' || public.push_category_name(v_tx->>'category')
-      || case when coalesce(btrim(v_tx->>'note'), '') <> ''
-              then ' «' || left(regexp_replace(btrim(v_tx->>'note'), '\s+', ' ', 'g'), 40) || '»'
-              else '' end
+      || public.push_tx_note(v_tx)
     );
     v_extra := v_extra + greatest(jsonb_array_length(v_removed) - 1, 0);
   end if;
@@ -241,9 +250,7 @@ begin
         'Изменён ' || case when v_tx->>'type' = 'income' then 'доход ' else 'расход ' end
         || public.push_money((v_tx->>'amount')::numeric, v_currency)
         || ' · ' || public.push_category_name(v_tx->>'category')
-        || case when coalesce(btrim(v_tx->>'note'), '') <> ''
-                then ' «' || left(regexp_replace(btrim(v_tx->>'note'), '\s+', ' ', 'g'), 40) || '»'
-                else '' end
+        || public.push_tx_note(v_tx)
       );
     end if;
     v_extra := v_extra + greatest(jsonb_array_length(v_changed) - 1, 0);
