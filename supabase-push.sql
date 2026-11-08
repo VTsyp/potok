@@ -1,5 +1,6 @@
 -- Поток: push-уведомления при изменениях в общем потоке.
 -- Выполните этот файл один раз в Supabase Dashboard -> SQL Editor -> Run.
+-- Файл можно запускать повторно: все объекты создаются безопасно.
 
 create extension if not exists pg_net with schema extensions;
 
@@ -84,6 +85,212 @@ $$;
 revoke all on function public.register_push_subscription(text, text, text, text) from public;
 grant execute on function public.register_push_subscription(text, text, text, text) to authenticated;
 
+/* ---------- текст уведомления ---------- */
+
+/* Название категории по её коду из приложения. */
+create or replace function public.push_category_name(p_id text)
+returns text
+language sql
+immutable
+as $$
+  select case p_id
+    when 'food' then 'Продукты'
+    when 'home' then 'Жильё'
+    when 'transport' then 'Транспорт'
+    when 'fun' then 'Развлечения'
+    when 'health' then 'Здоровье'
+    when 'clothes' then 'Одежда'
+    when 'subs' then 'Подписки'
+    when 'salary' then 'Зарплата'
+    when 'freelance' then 'Фриланс'
+    when 'gifts' then 'Подарки'
+    when 'invest' then 'Инвестиции'
+    else 'Другое'
+  end;
+$$;
+
+/* Сумма в валюте потока. В базе суммы хранятся в рублях. */
+create or replace function public.push_money(p_base numeric, p_currency text)
+returns text
+language sql
+stable
+as $$
+  select translate(
+    to_char(
+      coalesce(p_base, 0) / case p_currency
+        when 'EUR' then 100
+        when 'USD' then 90
+        when 'RSD' then 0.85
+        else 1
+      end,
+      case when p_currency in ('EUR', 'USD')
+        then 'FM999G999G999G999D00'
+        else 'FM999G999G999G999'
+      end
+    ),
+    ',.', ' ,'
+  ) || ' ' || case p_currency
+    when 'EUR' then '€'
+    when 'USD' then '$'
+    when 'RSD' then 'дин.'
+    else '₽'
+  end;
+$$;
+
+/* Русское склонение: 1 изменение, 2 изменения, 5 изменений. */
+create or replace function public.push_plural(p_n int, p_one text, p_few text, p_many text)
+returns text
+language sql
+immutable
+as $$
+  select case
+    when p_n % 100 between 11 and 14 then p_many
+    when p_n % 10 = 1 then p_one
+    when p_n % 10 between 2 and 4 then p_few
+    else p_many
+  end;
+$$;
+
+/* Что именно изменилось: «Новый расход 1 250 ₽ · Продукты «Пятёрочка»». */
+create or replace function public.push_describe_change(p_old jsonb, p_new jsonb)
+returns text
+language plpgsql
+stable
+as $$
+declare
+  v_currency text;
+  v_parts text[] := '{}';
+  v_extra int := 0;
+  v_added jsonb;
+  v_removed jsonb;
+  v_changed jsonb;
+  v_tx jsonb;
+  v_old_goal jsonb;
+  v_new_goal jsonb;
+  v_body text;
+begin
+  p_old := coalesce(p_old, '{}'::jsonb);
+  p_new := coalesce(p_new, '{}'::jsonb);
+  v_currency := coalesce(p_new->>'currency', 'RUB');
+  v_old_goal := p_old->'goal';
+  v_new_goal := p_new->'goal';
+
+  select jsonb_agg(n)
+  into v_added
+  from jsonb_array_elements(coalesce(p_new->'transactions', '[]'::jsonb)) n
+  where not exists (
+    select 1
+    from jsonb_array_elements(coalesce(p_old->'transactions', '[]'::jsonb)) o
+    where o->>'id' = n->>'id'
+  );
+
+  select jsonb_agg(o)
+  into v_removed
+  from jsonb_array_elements(coalesce(p_old->'transactions', '[]'::jsonb)) o
+  where not exists (
+    select 1
+    from jsonb_array_elements(coalesce(p_new->'transactions', '[]'::jsonb)) n
+    where n->>'id' = o->>'id'
+  );
+
+  select jsonb_agg(n)
+  into v_changed
+  from jsonb_array_elements(coalesce(p_new->'transactions', '[]'::jsonb)) n
+  join jsonb_array_elements(coalesce(p_old->'transactions', '[]'::jsonb)) o
+    on o->>'id' = n->>'id'
+  where n <> o;
+
+  if v_added is not null then
+    v_tx := v_added->0;
+    v_parts := array_append(v_parts,
+      case when v_tx->>'type' = 'income' then 'Новый доход ' else 'Новый расход ' end
+      || public.push_money((v_tx->>'amount')::numeric, v_currency)
+      || ' · ' || public.push_category_name(v_tx->>'category')
+      || case when coalesce(btrim(v_tx->>'note'), '') <> ''
+              then ' «' || left(regexp_replace(btrim(v_tx->>'note'), '\s+', ' ', 'g'), 40) || '»'
+              else '' end
+    );
+    v_extra := v_extra + greatest(jsonb_array_length(v_added) - 1, 0);
+  end if;
+
+  if v_removed is not null then
+    v_tx := v_removed->0;
+    v_parts := array_append(v_parts,
+      'Удалён ' || case when v_tx->>'type' = 'income' then 'доход ' else 'расход ' end
+      || public.push_money((v_tx->>'amount')::numeric, v_currency)
+      || ' · ' || public.push_category_name(v_tx->>'category')
+      || case when coalesce(btrim(v_tx->>'note'), '') <> ''
+              then ' «' || left(regexp_replace(btrim(v_tx->>'note'), '\s+', ' ', 'g'), 40) || '»'
+              else '' end
+    );
+    v_extra := v_extra + greatest(jsonb_array_length(v_removed) - 1, 0);
+  end if;
+
+  if v_changed is not null then
+    v_tx := v_changed->0;
+    if (v_tx - 'waste') = ((select o from jsonb_array_elements(coalesce(p_old->'transactions', '[]'::jsonb)) o where o->>'id' = v_tx->>'id' limit 1) - 'waste') then
+      v_parts := array_append(v_parts,
+        case when coalesce((v_tx->>'waste')::numeric, 0) > 0
+          then 'Отмечены утечки ' || public.push_money((v_tx->>'waste')::numeric, v_currency)
+          else 'Утечки сброшены'
+        end
+        || ' · ' || public.push_category_name(v_tx->>'category')
+      );
+    else
+      v_parts := array_append(v_parts,
+        'Изменён ' || case when v_tx->>'type' = 'income' then 'доход ' else 'расход ' end
+        || public.push_money((v_tx->>'amount')::numeric, v_currency)
+        || ' · ' || public.push_category_name(v_tx->>'category')
+        || case when coalesce(btrim(v_tx->>'note'), '') <> ''
+                then ' «' || left(regexp_replace(btrim(v_tx->>'note'), '\s+', ' ', 'g'), 40) || '»'
+                else '' end
+      );
+    end if;
+    v_extra := v_extra + greatest(jsonb_array_length(v_changed) - 1, 0);
+  end if;
+
+  if v_old_goal is distinct from v_new_goal then
+    if v_new_goal is null or jsonb_typeof(v_new_goal) = 'null' then
+      v_parts := array_append(v_parts, 'Цель удалена');
+    else
+      v_parts := array_append(v_parts,
+        'Цель «' || coalesce(nullif(btrim(v_new_goal->>'title'), ''), 'Моя цель') || '»'
+        || case
+             when v_new_goal->>'target' is distinct from v_old_goal->>'target'
+               then ' — ' || public.push_money((v_new_goal->>'target')::numeric, v_currency)
+             else ' · накоплено ' || public.push_money((v_new_goal->>'initial')::numeric, v_currency)
+           end
+      );
+    end if;
+  end if;
+
+  if coalesce(p_old->>'currency', 'RUB') <> v_currency then
+    v_parts := array_append(v_parts,
+      'Валюта потока: ' || case v_currency
+        when 'EUR' then '€'
+        when 'USD' then '$'
+        when 'RSD' then 'дин.'
+        else '₽'
+      end
+    );
+  end if;
+
+  if array_length(v_parts, 1) is null then
+    return 'Данные потока обновлены';
+  end if;
+
+  v_body := v_parts[1];
+  v_extra := v_extra + coalesce(array_length(v_parts, 1), 1) - 1;
+
+  if v_extra > 0 then
+    v_body := v_body || ' · и ещё ' || v_extra || ' '
+      || public.push_plural(v_extra, 'изменение', 'изменения', 'изменений');
+  end if;
+
+  return left(v_body, 180);
+end;
+$$;
+
 /* При изменении состояния потока отправляем событие в Vercel.
    Vercel уже рассылает push по подпискам участников, кроме автора изменения. */
 create or replace function public.notify_stream_update()
@@ -96,6 +303,7 @@ declare
   v_stream_name text;
   v_actor text;
   v_subscriptions jsonb;
+  v_body text;
 begin
   if new.state is not distinct from old.state then
     return new;
@@ -127,12 +335,14 @@ begin
     return new;
   end if;
 
+  v_body := public.push_describe_change(old.state, new.state);
+
   perform net.http_post(
     url := 'https://potok-ys2h.vercel.app/api/push',
     headers := jsonb_build_object('Content-Type', 'application/json'),
     body := jsonb_build_object(
-      'title', 'Поток · ' || coalesce(v_stream_name, 'общий поток'),
-      'body', coalesce(v_actor, 'Участник') || ' изменил(а) данные в потоке «' || coalesce(v_stream_name, 'Поток') || '»',
+      'title', coalesce(v_actor, 'Участник') || ' · ' || coalesce(v_stream_name, 'Поток'),
+      'body', v_body,
       'url', '/?stream=' || new.stream_id::text,
       'tag', 'potok-' || new.stream_id::text,
       'subscriptions', v_subscriptions
